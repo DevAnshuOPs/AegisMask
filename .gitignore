@@ -1,0 +1,35 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+.venv/
+venv/
+ENV/
+env/
+.uv_cache/
+.uv_python/
+
+# Operating system files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Raw Kaggle dataset and archives (large files)
+data/
+archive.zip
+*.zip
+
+# User IDE settings
+.vscode/
+.idea/
+
+# Explicitly ensure pre-trained models, checkpoints, and evaluation artifacts are tracked
+!models/
+!models/mask_classifier.pth
+!models/confusion_matrix.png
+!models/face_detector/
+!models/face_detector/deploy.prototxt
+!models/face_detector/res10_300x300_ssd_iter_140000.caffemodel
+!models/*.png
