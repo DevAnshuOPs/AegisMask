@@ -3,8 +3,9 @@ inference.py - Real-Time Live Surveillance Pipeline with Clamped Face ROI Extrac
 Features:
 - OpenCV Caffe SSD Face Detector with CLAHE contrast enhancement on LAB L-channel (detects dark/black masks).
 - Confidence threshold set to 0.45 and 50px minimum crop guard to eliminate background false detections.
-- 5-frame rolling probability smoother (deque(maxlen=5)) per face via centroid proximity (prevents flicker).
-- Decision thresholding: selects with_mask (Green) when P(0) > 0.48 and highest; otherwise mask_weared_incorrect (Amber) if P(2) >= 0.25 or P(1) < 0.55; otherwise without_mask (Red).
+- 8-frame rolling probability smoother (deque(maxlen=8)) per face with adaptive centroid matching (prevents flicker).
+- Recalibrated decision thresholding: with_mask (Green) when P(0) >= 0.42 and P(0) >= P(1); else mask_weared_incorrect (Amber) when P(2) >= 0.18 or P(1) < 0.68; else without_mask (Red).
+- Stage 2 crops extracted directly from CLAHE-enhanced frame with 10% context padding for high contrast on black masks.
 - Robust Two-Pass Coordinate Clamping with minimum size guard (Fix #3: eliminates (!ssize.empty()) crashes).
 - Dynamic Batching: All face crops in a frame are batched into a single 4D tensor for one forward pass.
 - Color-coded bounding boxes: Green (with_mask), Red (without_mask), Amber (mask_weared_incorrect).
@@ -54,7 +55,7 @@ class TrackedFace:
     def __init__(self, track_id: int, centroid: Tuple[int, int], probs: np.ndarray):
         self.track_id = track_id
         self.centroid = centroid
-        self.history = deque(maxlen=5)
+        self.history = deque(maxlen=8)
         self.history.append(probs)
         self.disappeared = 0
 
@@ -70,12 +71,13 @@ class TrackedFace:
 
 class CentroidTracker:
     """
-    Associates detected faces across frames based on Euclidean centroid proximity.
+    Associates detected faces across frames based on Euclidean centroid proximity
+    with an adaptive match radius max(base_distance, 0.6 * box_width).
     """
-    def __init__(self, max_distance: float = 100.0, max_disappeared: int = 15):
+    def __init__(self, base_distance: float = 90.0, max_disappeared: int = 15):
         self.next_track_id = 0
         self.tracks: Dict[int, TrackedFace] = {}
-        self.max_distance = max_distance
+        self.base_distance = base_distance
         self.max_disappeared = max_disappeared
 
     def update(self, detections: List[Tuple[Tuple[int, int, int, int], np.ndarray]]) -> List[Tuple[Tuple[int, int, int, int], np.ndarray]]:
@@ -132,11 +134,14 @@ class CentroidTracker:
         for row, col in zip(rows, cols):
             if row in used_rows or col in used_cols:
                 continue
-            if D[row, col] > self.max_distance:
+
+            box, raw_probs = detections[col]
+            box_width = float(box[2] - box[0])
+            adaptive_radius = max(self.base_distance, 0.6 * box_width)
+            if D[row, col] > adaptive_radius:
                 continue
 
             track_id = track_ids[row]
-            box, raw_probs = detections[col]
             self.tracks[track_id].update(input_centroids[col], raw_probs)
             results[col] = (box, self.tracks[track_id].smoothed_probs)
 
@@ -284,7 +289,7 @@ def run_surveillance(
     classifier = load_classifier(weights_path, device)
 
     # 3. Initialize Centroid Tracker & Probability Smoother
-    tracker = CentroidTracker(max_distance=90.0, max_disappeared=15)
+    tracker = CentroidTracker(base_distance=90.0, max_disappeared=15)
 
     # 4. Open Video Stream
     print(f"[VIDEO] Connecting to video source: {source}...")
@@ -317,13 +322,13 @@ def run_surveillance(
 
         h, w = frame.shape[:2]
 
-        # Fix (1): Apply CLAHE on LAB L-channel before feeding to SSD detector
-        # Enhances dark/black masks and low-contrast facial boundaries
-        ssd_input_frame = apply_clahe_contrast_enhancement(frame)
+        # Apply CLAHE on LAB L-channel
+        # Enhances dark/black masks, fabric textures, and low-contrast facial boundaries
+        frame_clahe = apply_clahe_contrast_enhancement(frame)
 
         # Stage 1: Caffe SSD 300x300 forward pass
         blob = cv2.dnn.blobFromImage(
-            cv2.resize(ssd_input_frame, (300, 300)),
+            cv2.resize(frame_clahe, (300, 300)),
             scalefactor=1.0,
             size=(300, 300),
             mean=(104.0, 177.0, 123.0),
@@ -340,12 +345,11 @@ def run_surveillance(
         num_detections = detections.shape[2]
         for i in range(num_detections):
             conf = float(detections[0, 0, i, 2])
-            # Fix (1): Lowered confidence threshold to 0.30
             if conf < confidence_thresh:
                 continue
 
             # ------------------------------------------------------------------
-            # Fix #3: Robust Two-Pass Coordinate Clamping with Minimum Size Guard
+            # Fix #3: Robust Two-Pass Coordinate Clamping with 50px Minimum Size Guard
             # ------------------------------------------------------------------
             # 1. First clamp normalized coordinates to [0.0, 1.0] and scale to pixel dimensions
             startX = int(max(0.0, min(float(detections[0, 0, i, 3]), 1.0)) * w)
@@ -355,24 +359,25 @@ def run_surveillance(
 
             box_w = endX - startX
             box_h = endY - startY
-            if box_w < 5 or box_h < 5:
+            if box_w < 50 or box_h < 50:
                 continue
 
             # 2. Add 10% context padding (preserves chin/jawline context for incorrect mask wear)
-            pad_w = int(0.10 * box_w)
-            pad_h = int(0.10 * box_h)
+            pad_x = int(0.10 * box_w)
+            pad_y = int(0.10 * box_h)
 
             # 3. Second clamp padded coordinates to frame boundaries
-            x1 = max(0, startX - pad_w)
-            y1 = max(0, startY - pad_h)
-            x2 = min(w, endX + pad_w)
+            x1 = max(0, startX - pad_x)
+            y1 = max(0, startY - pad_y)
+            x2 = min(w, endX + pad_x)
             y2 = min(h, endY + pad_h)
 
             # 4. Skip small/degenerate crops (< 50px) to eliminate background false detections
             if (x2 - x1) < 50 or (y2 - y1) < 50:
                 continue
 
-            face_roi = frame[y1:y2, x1:x2]
+            # Extract Stage 2 classifier crop from frame_clahe so black masks retain fabric contrast
+            face_roi = frame_clahe[y1:y2, x1:x2]
             if face_roi.size == 0 or face_roi.shape[0] == 0 or face_roi.shape[1] == 0:
                 continue
 
@@ -396,15 +401,15 @@ def run_surveillance(
 
         counts = {"total": len(smoothed_detections), 0: 0, 1: 0, 2: 0}
 
-        # Render bounding boxes and prediction tags with decision thresholding
+        # Render bounding boxes and prediction tags with recalibrated decision thresholding
         for (x1, y1, x2, y2), smoothed_probs in smoothed_detections:
-            # Decision logic:
-            # 1. with_mask (class 0, Green) if smoothed_probs[0] > 0.48 and smoothed_probs[0] is highest
-            # 2. Otherwise mask_weared_incorrect (class 2, Amber) if smoothed_probs[2] >= 0.25 or smoothed_probs[1] < 0.55
+            # Recalibrated decision thresholds for dark masks & low light:
+            # 1. with_mask (class 0, Green) when smoothed_probs[0] >= 0.42 and smoothed_probs[0] >= smoothed_probs[1]
+            # 2. Otherwise mask_weared_incorrect (class 2, Amber) when smoothed_probs[2] >= 0.18 or smoothed_probs[1] < 0.68
             # 3. Otherwise without_mask (class 1, Red)
-            if smoothed_probs[0] > 0.48 and smoothed_probs[0] >= smoothed_probs[1] and smoothed_probs[0] >= smoothed_probs[2]:
+            if smoothed_probs[0] >= 0.42 and smoothed_probs[0] >= smoothed_probs[1]:
                 pred_cls = 0
-            elif smoothed_probs[2] >= 0.25 or smoothed_probs[1] < 0.55:
+            elif smoothed_probs[2] >= 0.18 or smoothed_probs[1] < 0.68:
                 pred_cls = 2
             else:
                 pred_cls = 1
