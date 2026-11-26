@@ -4,7 +4,7 @@ Features:
 - OpenCV Caffe SSD Face Detector with CLAHE contrast enhancement on LAB L-channel (detects dark/black masks).
 - Confidence threshold set to 0.45 and 50px minimum crop guard to eliminate background false detections.
 - 8-frame rolling probability smoother (deque(maxlen=8)) per face with adaptive centroid matching (prevents flicker).
-- Recalibrated decision thresholding: with_mask (Green) when P(0) >= 0.42 and P(0) >= P(1); else mask_weared_incorrect (Amber) when P(2) >= 0.18 or P(1) < 0.68; else without_mask (Red).
+- Recalibrated decision thresholding: with_mask (Green) when P(0) >= 0.42 and P(0) >= P(1); else mask_weared_incorrect (Amber) when P(2) >= 0.08 or P(1) < 0.85; else without_mask (Red).
 - Stage 2 crops extracted directly from CLAHE-enhanced frame with 10% context padding for high contrast on black masks.
 - Robust Two-Pass Coordinate Clamping with minimum size guard (Fix #3: eliminates (!ssize.empty()) crashes).
 - Dynamic Batching: All face crops in a frame are batched into a single 4D tensor for one forward pass.
@@ -403,13 +403,15 @@ def run_surveillance(
 
         # Render bounding boxes and prediction tags with recalibrated decision thresholding
         for (x1, y1, x2, y2), smoothed_probs in smoothed_detections:
-            # Recalibrated decision thresholds for dark masks & low light:
+            p0, p1, p2 = float(smoothed_probs[0]), float(smoothed_probs[1]), float(smoothed_probs[2])
+
+            # Recalibrated decision thresholds for black masks pulled below nose:
             # 1. with_mask (class 0, Green) when smoothed_probs[0] >= 0.42 and smoothed_probs[0] >= smoothed_probs[1]
-            # 2. Otherwise mask_weared_incorrect (class 2, Amber) when smoothed_probs[2] >= 0.18 or smoothed_probs[1] < 0.68
+            # 2. Otherwise mask_weared_incorrect (class 2, Amber) when smoothed_probs[2] >= 0.08 or smoothed_probs[1] < 0.85
             # 3. Otherwise without_mask (class 1, Red)
             if smoothed_probs[0] >= 0.42 and smoothed_probs[0] >= smoothed_probs[1]:
                 pred_cls = 0
-            elif smoothed_probs[2] >= 0.18 or smoothed_probs[1] < 0.68:
+            elif smoothed_probs[2] >= 0.08 or smoothed_probs[1] < 0.85:
                 pred_cls = 2
             else:
                 pred_cls = 1
@@ -418,7 +420,7 @@ def run_surveillance(
 
             counts[pred_cls] = counts.get(pred_cls, 0) + 1
             color = CLASS_COLORS.get(pred_cls, (255, 255, 255))
-            label_text = f"{CLASS_NAMES[pred_cls]}: {pred_conf * 100:.1f}%"
+            label_text = f"{CLASS_NAMES[pred_cls]}: {pred_conf * 100:.1f}% [M:{p0:.2f} N:{p1:.2f} I:{p2:.2f}]"
 
             # Draw bounding box
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, 2)
