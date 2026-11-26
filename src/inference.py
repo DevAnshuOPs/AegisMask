@@ -370,7 +370,7 @@ def run_surveillance(
             x1 = max(0, startX - pad_x)
             y1 = max(0, startY - pad_y)
             x2 = min(w, endX + pad_x)
-            y2 = min(h, endY + pad_h)
+            y2 = min(h, endY + pad_y)
 
             # 4. Skip small/degenerate crops (< 50px) to eliminate background false detections
             if (x2 - x1) < 50 or (y2 - y1) < 50:
